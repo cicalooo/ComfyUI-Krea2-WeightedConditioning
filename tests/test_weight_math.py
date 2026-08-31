@@ -3,16 +3,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from krea2_weighted.attn_patch import APPLY_TO_KEY, _should_apply
-from krea2_weighted.tokenize import weight_factors
+import torch
+
+from krea2_weighted.attn_patch import APPLY_TO_KEY, _should_apply, compose_attn_mask
+from krea2_weighted.tokenize import mix_factors
 
 
-def test_plan_table():
-    assert weight_factors(1.0, 1, "k_bias") == (1.0, 0.0)
-    assert weight_factors(1.5, 1, "k_bias") == (1.0, 1.0)
-    assert weight_factors(0.5, 1, "k_bias") == (0.5, 0.0)
-    assert weight_factors(-1.0, 1, "k_bias") == (-1.0, 0.0)
-    assert weight_factors(2.0, 0.5, "k_bias") == (1.0, 1.0)
+def test_mix_factors():
+    assert mix_factors(0.45, "value_scale") == (0.45, 0.0)
+    assert mix_factors(1.0, "value_scale") == (1.0, 0.0)
+    assert mix_factors(0.5, "k_bias") == (0.5, 0.0)
+    assert mix_factors(1.5, "k_bias") == (1.0, 1.0)
+
+
+def test_compose_preserves_ref_boost():
+    ref = torch.zeros(1, 1, 4, 4)
+    ref[:, :, 2:, 1:3] = 2.0
+    kb = torch.tensor([[0.0, 0.5, 0.0, 0.0]])
+    out = compose_attn_mask(ref, kb)
+    assert float(out[0, 0, 2, 1]) == 2.5
+    assert float(out[0, 0, 2, 2]) == 2.0
 
 
 def test_apply_to_cond():

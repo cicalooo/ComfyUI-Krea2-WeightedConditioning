@@ -1,8 +1,6 @@
-"""ComfyUI nodes: prompt weighting and prompt mix for Krea 2."""
+"""ComfyUI node: Krea2 Prompt Mix (optional Mustyrocks K2Edit grounding)."""
 
 from __future__ import annotations
-
-import logging
 
 import torch
 
@@ -12,132 +10,11 @@ from .tokenize import (
     clip_token_ids,
     mix_factors,
     parse_block_range,
-    parse_weighted_terms,
-    resolve_weight_pairs,
     slice_to_cond_pairs,
+    slice_to_cond_pairs_after_vision,
+    token_ids_from_tok,
     user_span_from_ids,
 )
-
-LOG = logging.getLogger("krea2.weighted")
-
-
-class Krea2WeightedConditioning:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip": ("CLIP",),
-                "model": ("MODEL",),
-                "text": (
-                    "STRING",
-                    {
-                        "multiline": True,
-                        "default": "",
-                        "tooltip": (
-                            "Prompt with (phrase:weight). weight<1 scales the token VALUE "
-                            "(negative subtracts the concept); weight>1 boosts how much the "
-                            "image attends to the token. Plain text = 1.0. Set sampler CFG to 1.0. "
-                            "Not compatible with Krea2 Apply Regional (attention mask conflict)."
-                        ),
-                    },
-                ),
-                "strength": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": 0.0,
-                        "max": 4.0,
-                        "step": 0.05,
-                        "tooltip": (
-                            "Global multiplier. Effect compounds over patched blocks; "
-                            "lower if the image breaks up. Removal (weight<0) is the reliable direction."
-                        ),
-                    },
-                ),
-                "emphasis_mode": (
-                    ["k_bias", "value_scale", "both"],
-                    {"default": "k_bias"},
-                ),
-                "match_mode": (
-                    ["leading_space", "decode_window"],
-                    {"default": "leading_space"},
-                ),
-                "unmatched": (
-                    ["warn", "error", "ignore"],
-                    {"default": "warn"},
-                ),
-                "block_range": (
-                    "STRING",
-                    {
-                        "default": "all",
-                        "tooltip": "all, 0-27, 4,8,12, or mixed 0-5,10,20-27",
-                    },
-                ),
-                "apply_to": (
-                    ["cond", "uncond", "both"],
-                    {"default": "cond"},
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "STRING")
-    RETURN_NAMES = ("model", "conditioning", "debug")
-    FUNCTION = "encode"
-    CATEGORY = "Krea2/conditioning"
-    DESCRIPTION = (
-        "Per-token prompt weighting for Krea 2 via attention value scaling and k-bias. "
-        "Use (word:-1) to remove a concept, (word:1.5) to emphasize one. "
-        "Works through the Qwen3-VL encoder where CLIP-style weighting does nothing. "
-        "Wire both MODEL and CONDITIONING; set sampler CFG to 1.0. "
-        "Incompatible with Krea2 Apply Regional."
-    )
-    EXPERIMENTAL = True
-
-    def encode(
-        self,
-        clip,
-        model,
-        text,
-        strength,
-        emphasis_mode="k_bias",
-        match_mode="leading_space",
-        unmatched="warn",
-        block_range="all",
-        apply_to="cond",
-    ):
-        terms, clean = parse_weighted_terms(text or "")
-        tok = clip.tokenize(clean)
-        key = next(iter(tok))
-        ids = [t[0] for t in tok[key][0]]
-        cond = clip.encode_from_tokens_scheduled(tok)
-        cond_len = cond[0][0].shape[1]
-
-        if not terms:
-            return (
-                model,
-                cond,
-                "no (phrase:weight) terms; strength is unused. "
-                "This node does not scale a whole prompt. "
-                "Use Krea2 Prompt Mix to keep a main prompt at 1.0 and weaken a moodboard.",
-            )
-
-        pairs, debug = resolve_weight_pairs(
-            clip,
-            ids,
-            cond_len,
-            terms,
-            strength=strength,
-            emphasis_mode=emphasis_mode,
-            match_mode=match_mode,
-            unmatched=unmatched,
-        )
-        if not pairs:
-            return (model, cond, debug or "no matched phrases")
-
-        LOG.info("Krea2 Weighted Conditioning: %s", debug)
-        model_clone, indices = _patch_model(model, pairs, apply_to, block_range)
-        debug = "{}\npatched blocks: {}".format(debug, indices)
-        return (model_clone, cond, debug)
 
 
 def _patch_model(model, pairs, apply_to, block_range):
@@ -146,7 +23,7 @@ def _patch_model(model, pairs, apply_to, block_range):
     blocks = getattr(diffusion_model, "blocks", None)
     if blocks is None:
         raise RuntimeError(
-            "Krea2 Weighted Conditioning: model has no diffusion_model.blocks "
+            "Krea2 Prompt Mix: model has no diffusion_model.blocks "
             "(expected Krea 2 SingleStreamDiT)."
         )
     indices = parse_block_range(block_range, len(blocks))
@@ -163,9 +40,49 @@ def _patch_model(model, pairs, apply_to, block_range):
     return model_clone, indices
 
 
-def _ids_from_tok(tok):
-    key = next(iter(tok))
-    return [t[0] for t in tok[key][0]]
+# Mustyrocks K2Edit Qwen3-VL grounding (semantic path only — no latent/VAE/fit).
+K2EDIT_DEFAULT_SYSTEM = (
+    "Describe the image by detailing the color, shape, size, "
+    "texture, quantity, text, spatial relationships of the objects and background:"
+)
+
+
+def _k2edit_template(nimg, system_prompt=""):
+    sp = (system_prompt or "").strip() or K2EDIT_DEFAULT_SYSTEM
+    vis = "<|vision_start|><|image_pad|><|vision_end|>" * nimg
+    return (
+        "<|im_start|>system\n" + sp + "<|im_end|>\n<|im_start|>user\n"
+        + vis + "{}<|im_end|>\n<|im_start|>assistant\n"
+    )
+
+
+def _prep_grounding_image(image, grounding_px):
+    """Cap longest side and snap to Qwen3-VL's 28-pixel vision grid (patch 14 × merge 2)."""
+    samples = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
+    h, w = samples.shape[2], samples.shape[3]
+    if grounding_px and max(h, w) > grounding_px:
+        s = grounding_px / max(h, w)
+        nw = max(28, round(w * s) // 28 * 28)
+        nh = max(28, round(h * s) // 28 * 28)
+        try:
+            import comfy.utils
+
+            samples = comfy.utils.common_upscale(samples, nw, nh, "area", "disabled")
+        except ImportError:
+            samples = torch.nn.functional.interpolate(
+                samples.float(), size=(nh, nw), mode="area"
+            )
+    return samples.movedim(1, -1)[:, :, :, :3]
+
+
+def _grounding_images(image, image_b, grounding_px):
+    """Scene first, subject second — Mustyrocks training order."""
+    imgs = []
+    if image is not None:
+        imgs.append(_prep_grounding_image(image, grounding_px))
+    if image_b is not None:
+        imgs.append(_prep_grounding_image(image_b, grounding_px))
+    return imgs
 
 
 class Krea2PromptMix:
@@ -215,6 +132,42 @@ class Krea2PromptMix:
                 ),
                 "block_range": ("STRING", {"default": "all"}),
                 "apply_to": (["cond", "uncond", "both"], {"default": "cond"}),
+                "image": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "Optional K2Edit source (scene). When connected, encodes "
+                            "through Mustyrocks Qwen3-VL grounding (vision + instruction)."
+                        ),
+                    },
+                ),
+                "image_b": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "Optional second K2Edit reference (subject). Vision order: "
+                            "scene (image), then subject (image_b)."
+                        ),
+                    },
+                ),
+                "grounding_px": (
+                    "INT",
+                    {
+                        "default": 768,
+                        "min": 0,
+                        "max": 4096,
+                        "step": 64,
+                        "tooltip": "Cap longest side fed to Qwen3-VL; 0 = native. Same as Mustyrocks.",
+                    },
+                ),
+                "system_prompt": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "Override K2Edit grounding system prompt (empty = training default).",
+                    },
+                ),
             },
         }
 
@@ -223,10 +176,13 @@ class Krea2PromptMix:
     FUNCTION = "encode"
     CATEGORY = "Krea2/conditioning"
     DESCRIPTION = (
-        "Keep a handwritten prompt at 1.0 and scale a second (moodboard) prompt. "
+        "Keep a handwritten / edit instruction at 1.0 and scale a second (moodboard) prompt. "
         "Encodes both as one Qwen sequence so you do not ConditioningConcat two chat templates. "
-        "CFG 1.0; wire both MODEL and CONDITIONING. Do not use with Krea2 Apply Regional."
+        "Optional K2Edit image / image_b grounding (Mustyrocks Qwen3-VL prep). "
+        "Wire both MODEL and CONDITIONING. Identity-edit graphs: CFG as Mustyrocks specifies; "
+        "text-only mix still uses CFG 1.0. Do not use with Krea2 Apply Regional."
     )
+
     def encode(
         self,
         clip,
@@ -238,40 +194,71 @@ class Krea2PromptMix:
         emphasis_mode="value_scale",
         block_range="all",
         apply_to="cond",
+        image=None,
+        image_b=None,
+        grounding_px=768,
+        system_prompt="",
     ):
         main = (text_main or "").strip()
         aux = (text_aux or "").strip()
         sep = {"newline": "\n", "space": " ", "comma": ", "}[separator]
+        imgs = _grounding_images(image, image_b, grounding_px)
+        grounded = bool(imgs)
+        tok_kw = {}
+        if grounded:
+            tok_kw = {
+                "images": imgs,
+                "llama_template": _k2edit_template(len(imgs), system_prompt),
+            }
 
         if not aux:
-            tok = clip.tokenize(main)
+            tok = clip.tokenize(main, **tok_kw)
             cond = clip.encode_from_tokens_scheduled(tok)
-            return (model, cond, "empty aux; main only, no patch")
+            msg = "empty aux; main only, no patch"
+            if grounded:
+                msg += "; grounded {} image(s)".format(len(imgs))
+            return (model, cond, msg)
 
         combined = main + sep + aux if main else aux
-        tok = clip.tokenize(combined)
-        ids = _ids_from_tok(tok)
+        tok = clip.tokenize(combined, **tok_kw)
+        ids = token_ids_from_tok(tok)
         cond = clip.encode_from_tokens_scheduled(tok)
         cond_len = cond[0][0].shape[1]
         visible_start = len(ids) - cond_len
 
         v_factor, k_bias = mix_factors(aux_strength, emphasis_mode)
         if abs(v_factor - 1.0) < 1e-6 and abs(k_bias) < 1e-6:
-            return (model, cond, "aux_strength=1.0; no patch")
+            msg = "aux_strength=1.0; no patch"
+            if grounded:
+                msg += "; grounded {} image(s)".format(len(imgs))
+            return (model, cond, msg)
 
         if not main:
             cs, ce = user_span_from_ids(ids)
-            pairs = slice_to_cond_pairs(cs, ce, visible_start, cond_len, v_factor, k_bias)
+            if grounded:
+                pairs = slice_to_cond_pairs_after_vision(
+                    ids, cs, ce, cond_len, v_factor, k_bias
+                )
+            else:
+                pairs = slice_to_cond_pairs(cs, ce, visible_start, cond_len, v_factor, k_bias)
             debug = "main empty; scaled all user tokens"
         else:
-            ids_main = clip_token_ids(clip, main)
+            ids_main = clip_token_ids(clip, main, **tok_kw)
             aux_s, aux_e = aux_id_span_in_combined(ids, ids_main)
-            pairs = slice_to_cond_pairs(
-                aux_s, aux_e, visible_start, cond_len, v_factor, k_bias
-            )
+            if grounded:
+                pairs = slice_to_cond_pairs_after_vision(
+                    ids, aux_s, aux_e, cond_len, v_factor, k_bias
+                )
+            else:
+                pairs = slice_to_cond_pairs(
+                    aux_s, aux_e, visible_start, cond_len, v_factor, k_bias
+                )
             debug = "aux id[{}:{}] → {} cond tokens v={:.4f} k_bias={:.4f}".format(
                 aux_s, aux_e, len(pairs), v_factor, k_bias
             )
+
+        if grounded:
+            debug += "; grounded {} image(s)".format(len(imgs))
 
         if not pairs:
             return (model, cond, debug + "\nno aux positions in cond window")
@@ -280,91 +267,10 @@ class Krea2PromptMix:
         return (model_clone, cond, "{}\npatched blocks: {}".format(debug, indices))
 
 
-def _concat_conditioning(cond_to, cond_from):
-    """Same layout as ComfyUI ConditioningConcat (seq-dim cat)."""
-    out = []
-    src = cond_from[0][0]
-    for item in cond_to:
-        t1, extras = item[0], dict(item[1])
-        out.append([torch.cat((t1, src.to(t1.device, t1.dtype)), dim=1), extras])
-    return out
-
-
-class Krea2ConditioningMix:
-    """Concat two already-encoded conds and V-scale only the aux token slice."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "conditioning_main": ("CONDITIONING",),
-                "conditioning_aux": ("CONDITIONING",),
-                "aux_strength": (
-                    "FLOAT",
-                    {
-                        "default": 0.45,
-                        "min": 0.0,
-                        "max": 2.0,
-                        "step": 0.05,
-                        "tooltip": "Scale aux tokens after concat. Main stays 1.0.",
-                    },
-                ),
-            },
-            "optional": {
-                "emphasis_mode": (
-                    ["value_scale", "k_bias", "both"],
-                    {"default": "value_scale"},
-                ),
-                "block_range": ("STRING", {"default": "all"}),
-                "apply_to": (["cond", "uncond", "both"], {"default": "cond"}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "STRING")
-    RETURN_NAMES = ("model", "conditioning", "debug")
-    FUNCTION = "mix"
-    CATEGORY = "Krea2/conditioning"
-    DESCRIPTION = (
-        "Drop-in for ConditioningConcat when you want the second prompt weaker. "
-        "Main tokens stay at 1.0; aux tokens are V-scaled. "
-        "Prefer Krea2 Prompt Mix (one encode) — concat of two K2 CLIP encodes "
-        "duplicates the Qwen chat template. CFG 1.0."
-    )
-    EXPERIMENTAL = True
-
-    def mix(
-        self,
-        model,
-        conditioning_main,
-        conditioning_aux,
-        aux_strength,
-        emphasis_mode="value_scale",
-        block_range="all",
-        apply_to="cond",
-    ):
-        v_factor, k_bias = mix_factors(aux_strength, emphasis_mode)
-        combined = _concat_conditioning(conditioning_main, conditioning_aux)
-        main_len = int(conditioning_main[0][0].shape[1])
-        aux_len = int(conditioning_aux[0][0].shape[1])
-        pairs = [(main_len + i, v_factor, k_bias) for i in range(aux_len)]
-        debug = "concat main_len={} aux_len={} v={:.4f} k_bias={:.4f}".format(
-            main_len, aux_len, v_factor, k_bias
-        )
-        if abs(v_factor - 1.0) < 1e-6 and abs(k_bias) < 1e-6:
-            return (model, combined, debug + "\naux_strength=1.0; concat only")
-        model_clone, indices = _patch_model(model, pairs, apply_to, block_range)
-        return (model_clone, combined, "{}\npatched blocks: {}".format(debug, indices))
-
-
 NODE_CLASS_MAPPINGS = {
-    "Krea2WeightedConditioning": Krea2WeightedConditioning,
     "Krea2PromptMix": Krea2PromptMix,
-    "Krea2ConditioningMix": Krea2ConditioningMix,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Krea2WeightedConditioning": "Krea2 Weighted Conditioning",
     "Krea2PromptMix": "Krea2 Prompt Mix",
-    "Krea2ConditioningMix": "Krea2 Conditioning Mix",
 }

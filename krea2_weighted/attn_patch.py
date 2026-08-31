@@ -10,6 +10,34 @@ WEIGHTS_KEY = "krea2_token_weights"
 APPLY_TO_KEY = "krea2_weight_apply_to"
 
 
+def compose_attn_mask(existing, key_bias):
+    """Add Prompt Mix key bias onto an existing additive / bool attention mask.
+
+    K2Edit ``ref_boost`` passes a (1, 1, L, L) additive mask into attn.forward.
+    Key bias is a per-key vector ``(1, L)``. They add (broadcast) instead of
+    replacing, so identity-edit fidelity and aux emphasis can coexist.
+    """
+    if key_bias is None:
+        return existing
+    if existing is None:
+        return key_bias
+
+    e = existing
+    if e.dtype == torch.bool:
+        fill = torch.finfo(key_bias.dtype).min
+        e = torch.zeros(e.shape, dtype=key_bias.dtype, device=e.device)
+        e = e.masked_fill(~existing.bool(), fill)
+
+    kb = key_bias.to(device=e.device, dtype=e.dtype)
+    # (1, L) -> (1, 1, L) -> (1, 1, 1, L) so it adds on the key axis of (1, 1, L, L).
+    while kb.ndim < e.ndim:
+        if kb.ndim == 1:
+            kb = kb.unsqueeze(0)
+        else:
+            kb = kb.unsqueeze(-2)
+    return e + kb
+
+
 def _should_apply(transformer_options: dict) -> bool:
     apply_to = transformer_options.get(APPLY_TO_KEY, "cond")
     if apply_to == "both":
@@ -61,11 +89,11 @@ def krea2_attn_forward_weight(self, x, freqs=None, mask=None, transformer_option
             if kb != 0.0 and 0 <= pos < seq_k:
                 bias[:, pos] = kb
 
+    attn_mask = compose_attn_mask(mask, bias) if bias is not None else mask
     if bias is not None:
-        # Replaces any existing attention mask. Incompatible with Regional
-        # joint masks unless a later compose_masks path is added.
-        out = attention_pytorch(q, k, v, self.heads, mask=bias, skip_reshape=True)
+        out = attention_pytorch(q, k, v, self.heads, mask=attn_mask, skip_reshape=True)
     else:
+        # value_scale-only: keep the caller's mask (K2Edit ref_boost).
         out = optimized_attention(
             q, k, v, self.heads, mask=mask, skip_reshape=True,
             transformer_options=transformer_options,

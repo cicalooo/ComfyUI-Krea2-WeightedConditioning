@@ -9,6 +9,7 @@ dist/
 venv/
 env/
 .pytest_cache/
+.ruff_cache/
 .mypy_cache/
 .DS_Store
 Thumbs.db

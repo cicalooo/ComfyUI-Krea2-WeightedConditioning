@@ -5,13 +5,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
+from krea2_weighted.attn_patch import compose_attn_mask
 from krea2_weighted.nodes import (
-    Krea2ConditioningMix,
     Krea2PromptMix,
-    Krea2WeightedConditioning,
     NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS,
+    _grounding_images,
+    _k2edit_template,
+    _prep_grounding_image,
+    K2EDIT_DEFAULT_SYSTEM,
 )
-from krea2_weighted.tokenize import QWEN_IM_END, QWEN_IM_START, QWEN_NL, QWEN_USER
+from krea2_weighted.tokenize import (
+    QWEN_IM_END,
+    QWEN_IM_START,
+    QWEN_NL,
+    QWEN_USER,
+)
 
 
 class FakeAttn:
@@ -48,63 +57,63 @@ class FakeModel:
         self.patches.append((path, fn))
 
 
+VISION_EXPAND = 4  # tokens each image_pad becomes after Qwen expansion
+
+
 class FakeClip:
-    def tokenize(self, text):
+    def __init__(self):
+        self.last_images = None
+        self.last_template = None
+
+    def tokenize(self, text, images=None, llama_template=None, **kwargs):
+        self.last_images = images
+        self.last_template = llama_template
         parts = text.split()
         user = []
         for i, w in enumerate(parts):
             key = (" " + w) if (i > 0 or text.startswith(" ")) else w
-            # Isolated "ghost" uses an id that never appears in a longer prompt,
-            # simulating a BPE mismatch (the unmatched=error path).
-            if w == "ghost" and len(parts) == 1:
-                user.append(99999)
-            else:
-                user.append(200 + (abs(hash(key)) % 50000))
-        ids = [QWEN_IM_START, QWEN_USER, QWEN_NL] + user + [QWEN_IM_END]
+            user.append(200 + (abs(hash(key)) % 50000))
+        vision = []
+        if images:
+            for img in images:
+                vision.extend(
+                    [
+                        151652,
+                        {"type": "image", "data": img, "original_type": "image"},
+                        151653,
+                    ]
+                )
+        ids = [QWEN_IM_START, QWEN_USER, QWEN_NL] + vision + user + [QWEN_IM_END]
         return {"qwen3vl_4b": [[(i, 1.0) for i in ids]]}
 
     def encode_from_tokens_scheduled(self, tok):
         key = next(iter(tok))
-        ids = [t[0] for t in tok[key][0]]
-        visible = ids[3:]  # drop im_start,user,nl
+        raw = [t[0] for t in tok[key][0]]
+        visible = []
+        for e in raw[3:]:  # drop im_start,user,nl
+            if isinstance(e, dict) and e.get("type") == "image":
+                visible.extend([0] * VISION_EXPAND)
+            else:
+                visible.append(0)
         t = torch.zeros(1, len(visible), 8)
         return [[t, {}]]
 
 
+def _rgb(h, w, val=0.2):
+    return torch.full((1, h, w, 3), val)
+
+
 def test_mappings():
-    assert "Krea2WeightedConditioning" in NODE_CLASS_MAPPINGS
-    assert "Krea2PromptMix" in NODE_CLASS_MAPPINGS
-    assert "Krea2ConditioningMix" in NODE_CLASS_MAPPINGS
-    types = Krea2WeightedConditioning.INPUT_TYPES()
+    assert list(NODE_CLASS_MAPPINGS) == ["Krea2PromptMix"]
+    assert NODE_DISPLAY_NAME_MAPPINGS["Krea2PromptMix"] == "Krea2 Prompt Mix"
+    types = Krea2PromptMix.INPUT_TYPES()
     assert "clip" in types["required"]
-    assert "text" in types["required"]
-
-
-def test_encode_no_weights_passthrough():
-    node = Krea2WeightedConditioning()
-    model = FakeModel()
-    clip = FakeClip()
-    out_model, cond, debug = node.encode(
-        clip, model, "a red hat", strength=1.0
-    )
-    assert out_model is model
-    assert cond[0][0].shape[1] > 0
-    assert "no (phrase:weight)" in debug
-
-
-def test_encode_patches_blocks():
-    node = Krea2WeightedConditioning()
-    model = FakeModel()
-    clip = FakeClip()
-    out_model, cond, debug = node.encode(
-        clip, model, "a (red:1.5) hat", strength=1.0, unmatched="warn"
-    )
-    assert out_model is not model
-    assert out_model.patches
-    assert all(p[0].endswith("attn.forward") for p in out_model.patches)
-    tw = out_model.model_options["transformer_options"]["krea2_token_weights"]
-    assert tw
-    assert "red" in debug
+    assert "text_main" in types["required"]
+    assert "text_aux" in types["required"]
+    assert "image" in types["optional"]
+    assert "image_b" in types["optional"]
+    assert "grounding_px" in types["optional"]
+    assert "system_prompt" in types["optional"]
 
 
 def test_prompt_mix_scales_aux_only():
@@ -125,23 +134,140 @@ def test_prompt_mix_scales_aux_only():
     assert "aux id" in debug
 
 
-def test_conditioning_mix_offsets_positions():
-    node = Krea2ConditioningMix()
+def test_prompt_mix_grounded_one_image():
+    node = Krea2PromptMix()
     model = FakeModel()
-    main = [[torch.zeros(1, 4, 8), {}]]
-    aux = [[torch.zeros(1, 3, 8), {}]]
-    out_model, combined, debug = node.mix(model, main, aux, aux_strength=0.5)
-    assert combined[0][0].shape[1] == 7
+    clip = FakeClip()
+    img = _rgb(32, 32)
+    out_model, cond, debug = node.encode(
+        clip,
+        model,
+        text_main="recolor the car",
+        text_aux="cinematic grain",
+        aux_strength=0.45,
+        image=img,
+    )
+    assert out_model is not model
+    assert "grounded 1 image" in debug
     tw = out_model.model_options["transformer_options"]["krea2_token_weights"]
-    assert [p[0] for p in tw] == [4, 5, 6]
+    assert tw
+    assert all(abs(p[1] - 0.45) < 1e-6 for p in tw)
+    # vision tokens occupy the front of the cond window
+    n_vis_markers = 2  # vis_start + vis_end (pad expands)
+    vis_block = n_vis_markers + VISION_EXPAND
+    aux_pos = [p[0] for p in tw]
+    assert min(aux_pos) >= vis_block
+    assert clip.last_images is not None and len(clip.last_images) == 1
+    assert K2EDIT_DEFAULT_SYSTEM.split()[0] in (clip.last_template or "")
 
 
-def test_unmatched_error_from_node():
-    node = Krea2WeightedConditioning()
-    try:
-        node.encode(
-            FakeClip(), FakeModel(), "a (ghost:2) hat", strength=1.0, unmatched="error"
-        )
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError")
+def test_prompt_mix_two_image_ordering():
+    node = Krea2PromptMix()
+    clip = FakeClip()
+    scene = _rgb(32, 32, 0.1)
+    subject = _rgb(32, 32, 0.9)
+    node.encode(
+        clip,
+        FakeModel(),
+        text_main="put the person in the room",
+        text_aux="film still",
+        aux_strength=0.4,
+        image=scene,
+        image_b=subject,
+    )
+    assert len(clip.last_images) == 2
+    # scene (image) first, subject (image_b) second
+    assert float(clip.last_images[0].reshape(-1)[0]) < float(clip.last_images[1].reshape(-1)[0])
+    vis = "<|vision_start|><|image_pad|><|vision_end|>"
+    assert clip.last_template.count(vis) == 2
+
+
+def test_prompt_mix_aux_after_vision_expansion_only_aux_text():
+    node = Krea2PromptMix()
+    clip = FakeClip()
+    img = _rgb(28, 28)
+    out_model, cond, debug = node.encode(
+        clip,
+        FakeModel(),
+        text_main="edit the jacket",
+        text_aux="neon",
+        aux_strength=0.3,
+        image=img,
+    )
+    tw = out_model.model_options["transformer_options"]["krea2_token_weights"]
+    aux_pos = [p[0] for p in tw]
+    vis_block = 2 + VISION_EXPAND
+    assert min(aux_pos) >= vis_block
+    # cond: vis_start, 4 vision, vis_end, main tokens..., aux..., im_end
+    # "edit the jacket" = 3 tokens, "neon" = 1, plus im_end
+    assert max(aux_pos) < cond[0][0].shape[1]
+    # do not weight the vision block
+    assert not any(p < vis_block for p in aux_pos)
+
+
+def test_prompt_mix_empty_aux_still_grounded():
+    node = Krea2PromptMix()
+    model = FakeModel()
+    clip = FakeClip()
+    img = _rgb(32, 32)
+    out_model, cond, debug = node.encode(
+        clip,
+        model,
+        text_main="recolor the car",
+        text_aux="",
+        aux_strength=0.45,
+        image=img,
+    )
+    assert out_model is model
+    assert "empty aux" in debug
+    assert "grounded 1 image" in debug
+    assert cond[0][0].shape[1] > 4  # vision expansion present
+    assert clip.last_images is not None
+
+
+def test_prompt_mix_aux_strength_one_grounded_no_patch():
+    node = Krea2PromptMix()
+    model = FakeModel()
+    clip = FakeClip()
+    img = _rgb(32, 32)
+    out_model, cond, debug = node.encode(
+        clip,
+        model,
+        text_main="recolor the car",
+        text_aux="cinematic grain",
+        aux_strength=1.0,
+        image=img,
+    )
+    assert out_model is model
+    assert "aux_strength=1.0" in debug
+    assert "grounded 1 image" in debug
+    assert cond[0][0].shape[1] > 4
+
+
+def test_k2edit_ref_mask_composes_with_key_bias():
+    L = 8
+    ref = torch.zeros(1, 1, L, L)
+    ref[:, :, 5:, 2:4] = 1.5  # K2Edit ref_boost on ref key columns
+    kb = torch.zeros(1, L)
+    kb[:, 3] = 0.2  # Prompt Mix aux key bias
+    out = compose_attn_mask(ref, kb)
+    assert abs(float(out[0, 0, 5, 3]) - 1.7) < 1e-5
+    assert abs(float(out[0, 0, 5, 2]) - 1.5) < 1e-5
+    assert abs(float(out[0, 0, 0, 3]) - 0.2) < 1e-5
+    assert compose_attn_mask(None, kb) is kb
+    assert compose_attn_mask(ref, None) is ref
+
+
+def test_prep_28_pixel_grid_and_template():
+    big = _rgb(200, 100)
+    out = _prep_grounding_image(big, 56)
+    h, w = out.shape[1], out.shape[2]
+    assert h % 28 == 0 and w % 28 == 0
+    assert max(h, w) <= 56
+    imgs = _grounding_images(big, _rgb(40, 40, 0.8), 768)
+    assert len(imgs) == 2
+    tpl = _k2edit_template(2, "")
+    assert K2EDIT_DEFAULT_SYSTEM in tpl
+    assert tpl.count("<|image_pad|>") == 2
+
+
