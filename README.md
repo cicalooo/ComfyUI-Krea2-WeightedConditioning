@@ -2,7 +2,7 @@
 
 **Krea2 Prompt Mix** keeps a handwritten / edit instruction at strength 1.0 and scales a second (moodboard / style) prompt through K2 **self-attention**. Stock `(word:1.4)` is CLIP-era syntax; K2 reads the prompt through **Qwen3-VL**, which ignores it.
 
-Optional **Mustyrocks K2 Edit** image grounding: the same Qwen3-VL prep (resize, 28-pixel vision grid, system prompt, scene-then-subject order). Source latents stay on `Krea2EditModelPatch`.
+Optional **Mustyrocks K2 Edit** image grounding (ignored unless you connect an image): the same Qwen3-VL prep as Grounded Encode. Source latents stay on `Krea2EditModelPatch`.
 
 **Sampler CFG must be 1.0 for text-only mix.** For **Mustyrocks K2 Edit**, follow that pack’s CFG (Turbo CFG 1; Raw removals ~CFG 3). Wire **both** `MODEL` and `CONDITIONING`. Load LoRAs *before* this node so the attention patch is last.
 
@@ -21,12 +21,16 @@ Restart ComfyUI. No extra Python packages. Needs a ComfyUI build with native Kre
 
 ## Krea2 Prompt Mix
 
+![Krea2 Prompt Mix node](prompt-mix.png)
+
 Moodboard dumps steal the subject if you concat two CLIP encodes or wrap the board in `(prompt:0.5)`. Prompt Mix encodes **one** sequence:
 
 ```
 [ handwritten prompt ] [ moodboard / style ]
        strength 1.0         aux_strength (default 0.45)
 ```
+
+**K2Edit inputs are optional.** If you are not using Mustyrocks K2 Edit, leave `image`, `image_b`, `grounding_px`, and `system_prompt` disconnected. They do nothing in that case — Prompt Mix is a normal text mix.
 
 ```
 STRING (subject) ──────── text_main ─┐
@@ -41,9 +45,13 @@ UNET ──────────────────── model ──�
 
 `debug` reports how many aux tokens were scaled. If that count is ~0, the join failed to split — check that `text_main` is really the prefix of the combined prompt.
 
-### Optional K2Edit grounding
+### Using with Mustyrocks K2 Edit
 
-Connect Mustyrocks source **image** (and **image_b** for two-ref) on Prompt Mix. The node reproduces only the Qwen3-VL grounding prep from Mustyrocks. It does **not** inject source latents — keep `Krea2EditModelPatch` for that.
+When you *are* running Identity Edit, wire Prompt Mix **the same way you would Mustyrocks Grounded Encode**: same CLIP, same source `image` (and `image_b` for two-ref), edit instruction on `text_main`. Prompt Mix performs that grounding internally, then also mixes `text_aux`.
+
+Leave Mustyrocks **positive** Grounded Encode off the graph. Keep `Krea2EditModelPatch` for source latents — Prompt Mix does not inject latents.
+
+The K2Edit-related sockets (`image`, `image_b`, `grounding_px`, `system_prompt`) are only used when an image is connected. Unconnected, they are ignored.
 
 One grounded sequence:
 
