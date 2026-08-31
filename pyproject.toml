@@ -1,0 +1,20 @@
+[project]
+name = "comfyui-krea2-weightedconditioning"
+description = "Krea 2 prompt mix and per-token (phrase:weight) via attention scaling — CLIP emphasis does not work on Qwen3-VL."
+version = "0.1.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/doggeddalle/ComfyUI-Krea2-WeightedConditioning"
+
+[tool.comfy]
+PublisherId = "doggeddalle"
+DisplayName = "Krea 2 Weighted Conditioning"
+Icon = ""
