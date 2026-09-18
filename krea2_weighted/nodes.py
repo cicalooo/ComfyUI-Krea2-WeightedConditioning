@@ -119,7 +119,8 @@ class Krea2PromptMix:
                         "step": 0.05,
                         "tooltip": (
                             "Strength of the moodboard tokens only. 1.0 = same as main, "
-                            "0.45 = typical weaken, 0 = ignore aux. Not CLIP (prompt:0.5)."
+                            "0.45 = typical weaken, 0 = omit aux and encode main only. "
+                            "Not CLIP (prompt:0.5)."
                         ),
                     },
                 ),

@@ -39,7 +39,7 @@ CLIP (type krea2) ─────── clip ──────┤             �
 UNET ──────────────────── model ─────┘
 ```
 
-- `aux_strength` **0.35–0.55** is the usual weaken. `1.0` = equal; `0` = ignore aux.
+- `aux_strength` **0.35–0.55** is the usual weaken. `1.0` = equal. `0.0` omits aux before tokenization and returns the same main-only conditioning as standard **CLIP Text Encode** (or grounded main-only conditioning when an image is connected), with no model patch.
 - `apply_to` = **cond** (CFG 1 has no uncond pass).
 - Do **not** `ConditioningConcat` two K2 encodes. Each encode already includes the chat template.
 
@@ -76,7 +76,7 @@ source image(s) + main edit instruction + auxiliary prompt
 - Prompt Mix **replaces** Mustyrocks positive `Grounded Encode` (it runs the same grounding internally).
 - For **CFG > 1**, the negative stays an **empty instruction grounded with the same image(s)** via Mustyrocks Grounded Encode (trained unconditional).
 - `grounding_px` default 768 (0 = native). Empty `system_prompt` uses the Mustyrocks training default.
-- Empty aux still returns grounded main conditioning (no patch). `aux_strength=1.0` returns grounded combined conditioning with no patch.
+- Empty aux and `aux_strength=0.0` both return grounded main-only conditioning with no model patch. `aux_strength=1.0` returns grounded combined conditioning with no patch.
 
 ## Wiring notes
 

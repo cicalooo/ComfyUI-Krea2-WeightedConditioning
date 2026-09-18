@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `aux_strength=0.0` so Prompt Mix omits aux before Qwen tokenization and exactly follows the main-only encode path instead of leaving aux context in the conditioning sequence.
+
 ## 0.3.0
 
 - Pack now ships only **Krea2 Prompt Mix** (including optional K2Edit grounding).
