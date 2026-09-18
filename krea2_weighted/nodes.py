@@ -211,10 +211,16 @@ class Krea2PromptMix:
                 "llama_template": _k2edit_template(len(imgs), system_prompt),
             }
 
+        main_only_reason = None
         if not aux:
+            main_only_reason = "empty aux"
+        elif float(aux_strength) == 0.0:
+            main_only_reason = "aux_strength=0.0"
+
+        if main_only_reason is not None:
             tok = clip.tokenize(main, **tok_kw)
             cond = clip.encode_from_tokens_scheduled(tok)
-            msg = "empty aux; main only, no patch"
+            msg = "{}; main only, no patch".format(main_only_reason)
             if grounded:
                 msg += "; grounded {} image(s)".format(len(imgs))
             return (model, cond, msg)

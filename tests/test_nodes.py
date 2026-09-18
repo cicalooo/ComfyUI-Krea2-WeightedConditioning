@@ -134,6 +134,64 @@ def test_prompt_mix_scales_aux_only():
     assert "aux id" in debug
 
 
+def test_prompt_mix_zero_strength_matches_standard_text_encode():
+    node = Krea2PromptMix()
+    model = FakeModel()
+    clip = FakeClip()
+
+    standard_clip = FakeClip()
+    standard_tokens = standard_clip.tokenize("a woman")
+    standard_cond = standard_clip.encode_from_tokens_scheduled(standard_tokens)
+
+    out_model, cond, debug = node.encode(
+        clip,
+        model,
+        text_main="a woman",
+        text_aux="cinematic grain",
+        aux_strength=0.0,
+    )
+
+    assert out_model is model
+    assert torch.equal(cond[0][0], standard_cond[0][0])
+    assert cond[0][0].shape == standard_cond[0][0].shape
+    assert debug == "aux_strength=0.0; main only, no patch"
+
+
+def test_prompt_mix_zero_strength_matches_grounded_empty_aux():
+    node = Krea2PromptMix()
+    image = _rgb(32, 32)
+
+    zero_model = FakeModel()
+    zero_clip = FakeClip()
+    zero_out, zero_cond, zero_debug = node.encode(
+        zero_clip,
+        zero_model,
+        text_main="recolor the car",
+        text_aux="cinematic grain",
+        aux_strength=0.0,
+        image=image,
+    )
+
+    empty_model = FakeModel()
+    empty_clip = FakeClip()
+    empty_out, empty_cond, _ = node.encode(
+        empty_clip,
+        empty_model,
+        text_main="recolor the car",
+        text_aux="",
+        aux_strength=0.45,
+        image=image,
+    )
+
+    assert zero_out is zero_model
+    assert empty_out is empty_model
+    assert torch.equal(zero_cond[0][0], empty_cond[0][0])
+    assert zero_cond[0][0].shape == empty_cond[0][0].shape
+    assert len(zero_clip.last_images) == 1
+    assert zero_clip.last_template == empty_clip.last_template
+    assert zero_debug == "aux_strength=0.0; main only, no patch; grounded 1 image(s)"
+
+
 def test_prompt_mix_grounded_one_image():
     node = Krea2PromptMix()
     model = FakeModel()
