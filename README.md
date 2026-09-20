@@ -1,14 +1,19 @@
 # ComfyUI Krea 2 Weighted Conditioning
 
-**Krea2 Prompt Mix** keeps a handwritten / edit instruction at strength 1.0 and scales a second (moodboard / style) prompt through K2 **self-attention**. Stock `(word:1.4)` is CLIP-era syntax; K2 reads the prompt through **Qwen3-VL**, which ignores it.
+**Krea2 Prompt Mix** — keep a subject / edit instruction at strength **1.0**, and scale a second moodboard / style prompt through Krea 2 **self-attention**.
 
-Optional **Mustyrocks K2 Edit** image grounding (ignored unless you connect an image): the same Qwen3-VL prep as Grounded Encode. Source latents stay on `Krea2EditModelPatch`.
+Stock `(word:1.4)` is CLIP-era syntax. Krea 2 reads prompts through **Qwen3-VL**, which ignores it. This node encodes **one** Qwen sequence and weakens only the auxiliary tokens — so the moodboard does not steal the subject.
 
-**Sampler CFG must be 1.0 for text-only mix.** For **Mustyrocks K2 Edit**, follow that pack’s CFG (Turbo CFG 1; Raw removals ~CFG 3). Wire **both** `MODEL` and `CONDITIONING`. Load LoRAs *before* this node so the attention patch is last.
+Optional **Mustyrocks K2 Edit** image grounding (same Qwen3-VL prep as Grounded Encode). Leave image inputs disconnected for plain text mix.
 
-`value_scale` (default) leaves K2Edit `ref_boost` masks in place. `k_bias` / `both` **add** key bias on top of that mask. Incompatible with **Krea2 Apply Regional** joint masks.
+| | |
+|---|---|
+| **Node** | Krea2 Prompt Mix |
+| **Category** | `Krea2/conditioning` |
+| **Outputs** | `MODEL`, `CONDITIONING`, `debug` |
+| **Deps** | Native ComfyUI Krea 2; no extra pip packages |
 
-Category: `Krea2/conditioning`. Node: **Krea2 Prompt Mix**.
+---
 
 ## Install
 
@@ -17,20 +22,27 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/cicalooo/ComfyUI-Krea2-WeightedConditioning.git
 ```
 
-Restart ComfyUI. No extra Python packages. Needs a ComfyUI build with native Krea 2.
+Restart ComfyUI.
 
-## Krea2 Prompt Mix
+---
+
+## Why Prompt Mix?
+
+Concatenating two K2 encodes (or wrapping the board in `(prompt:0.5)`) often lets the moodboard dominate. Prompt Mix builds a single sequence:
+
+```
+[ handwritten / edit instruction ]  [ moodboard / style ]
+         strength 1.0                    aux_strength (default 0.45)
+```
+
+- **Do not** `ConditioningConcat` two K2 encodes — each already carries the chat template.
+- Wire **both** `MODEL` and `CONDITIONING` into the sampler.
+- Load LoRAs **before** this node so the attention patch is applied last.
+- Incompatible with **Krea2 Apply Regional** joint masks.
 
 ![Krea2 Prompt Mix node](prompt-mix.png)
 
-Moodboard dumps steal the subject if you concat two CLIP encodes or wrap the board in `(prompt:0.5)`. Prompt Mix encodes **one** sequence:
-
-```
-[ handwritten prompt ] [ moodboard / style ]
-       strength 1.0         aux_strength (default 0.45)
-```
-
-**K2Edit inputs are optional.** If you are not using Mustyrocks K2 Edit, leave `image`, `image_b`, `grounding_px`, and `system_prompt` disconnected. They do nothing in that case — Prompt Mix is a normal text mix.
+### Text-only wiring
 
 ```
 STRING (subject) ──────── text_main ─┐
@@ -39,19 +51,42 @@ CLIP (type krea2) ─────── clip ──────┤             �
 UNET ──────────────────── model ─────┘
 ```
 
-- `aux_strength` **0.35–0.55** is the usual weaken. `1.0` = equal. `0.0` omits aux before tokenization and returns the same main-only conditioning as standard **CLIP Text Encode** (or grounded main-only conditioning when an image is connected), with no model patch.
-- `apply_to` = **cond** (CFG 1 has no uncond pass).
-- Do **not** `ConditioningConcat` two K2 encodes. Each encode already includes the chat template.
+`image`, `image_b`, `grounding_px`, and `system_prompt` are **ignored** when no image is connected.
 
-`debug` reports how many aux tokens were scaled. If that count is ~0, the join failed to split — check that `text_main` is really the prefix of the combined prompt.
+### Parameters
 
-### Using with Mustyrocks K2 Edit
+| Parameter | Notes |
+|---|---|
+| `aux_strength` | **0.35–0.55** typical weaken · `1.0` equal · `0.0` omits aux and encodes main only (no model patch) |
+| `emphasis_mode` | `value_scale` (default) · `k_bias` · `both` |
+| `apply_to` | `cond` (CFG 1 has no uncond pass) |
+| `block_range` | `all` (default), `0-27`, or `4,8,12` if the effect is too strong |
+| `separator` | How main and aux are joined before tokenization |
+| `debug` | Reports how many aux tokens were scaled; ~0 means the join failed to split |
 
-When you *are* running Identity Edit, wire Prompt Mix **the same way you would Mustyrocks Grounded Encode**: same CLIP, same source `image` (and `image_b` for two-ref), edit instruction on `text_main`. Prompt Mix performs that grounding internally, then also mixes `text_aux`.
+`value_scale` leaves K2Edit `ref_boost` masks alone. `k_bias` / `both` **add** key bias on top of that mask.
 
-Leave Mustyrocks **positive** Grounded Encode off the graph. Keep `Krea2EditModelPatch` for source latents — Prompt Mix does not inject latents.
+### Sampler CFG
 
-The K2Edit-related sockets (`image`, `image_b`, `grounding_px`, `system_prompt`) are only used when an image is connected. Unconnected, they are ignored.
+| Mode | CFG |
+|---|---|
+| Text-only mix | **1.0** |
+| Mustyrocks K2 Edit (Turbo) | **1** |
+| Mustyrocks Raw (e.g. delete salient content) | ~**3**, ~20 steps (per Mustyrocks) |
+
+Keep an empty negative if your K2 graph goes grainy without one. For text-only CFG 1, `ConditioningZeroOut` on the mixed cond is fine.
+
+**Conditioning Krea 2 Rebalance** can sit on the CONDITIONING output (tap EQ). Orthogonal to this node.
+
+---
+
+## Mustyrocks K2 Edit (optional)
+
+When running Identity Edit, wire Prompt Mix like Mustyrocks **Grounded Encode**: same CLIP, same source `image` (and `image_b` for two-ref), edit instruction on `text_main`. Prompt Mix grounds internally, then mixes `text_aux`.
+
+- Leave Mustyrocks **positive** Grounded Encode off the graph.
+- Keep **`Krea2EditModelPatch`** for source latents — Prompt Mix does not inject latents.
+- For **CFG > 1**, negative = empty instruction grounded with the **same image(s)** via Mustyrocks Grounded Encode (trained unconditional).
 
 One grounded sequence:
 
@@ -59,44 +94,68 @@ One grounded sequence:
 [vision tokens] [main edit instruction @ 1.0] [aux / moodboard @ aux_strength]
 ```
 
-Aux weights are applied **after** Qwen expands `<|image_pad|>` into vision tokens, so vision tokens, the main instruction, and chat-template tokens stay at 1.0.
+Aux weights are applied **after** Qwen expands `<|image_pad|>` into vision tokens, so vision, main instruction, and chat-template tokens stay at 1.0.
 
 ```
 Krea2 model
-  -> Identity Edit LoRA
-  -> Mustyrocks K2 Edit source patch
-  -> Grounded Krea2 Prompt Mix model
-  -> KSampler.model
+  → Identity Edit LoRA
+  → Mustyrocks K2 Edit source patch
+  → Prompt Mix (model)
+  → KSampler.model
 
-source image(s) + main edit instruction + auxiliary prompt
-  -> Grounded Krea2 Prompt Mix conditioning
-  -> KSampler.positive
+source image(s) + main edit + aux prompt
+  → Prompt Mix (conditioning)
+  → KSampler.positive
 ```
 
-- Prompt Mix **replaces** Mustyrocks positive `Grounded Encode` (it runs the same grounding internally).
-- For **CFG > 1**, the negative stays an **empty instruction grounded with the same image(s)** via Mustyrocks Grounded Encode (trained unconditional).
-- `grounding_px` default 768 (0 = native). Empty `system_prompt` uses the Mustyrocks training default.
-- Empty aux and `aux_strength=0.0` both return grounded main-only conditioning with no model patch. `aux_strength=1.0` returns grounded combined conditioning with no patch.
+| Input | Role |
+|---|---|
+| `image` | Scene / primary K2Edit source |
+| `image_b` | Optional second ref (subject); order is scene then subject |
+| `grounding_px` | Cap longest side to Qwen3-VL (default **768**; `0` = native) |
+| `system_prompt` | Override grounding system prompt (empty = Mustyrocks training default) |
 
-## Wiring notes
+Empty aux and `aux_strength=0.0` both return grounded main-only conditioning with no model patch. `aux_strength=1.0` returns grounded combined conditioning with no patch.
 
-- Text-only Prompt Mix: CFG **1.0**. Identity edit with grounding: Turbo CFG 1; Raw “delete salient content” needs real CFG (Mustyrocks: Raw CFG ~3, ~20 steps) and a grounded empty negative.
-- Keep an empty negative slot if your K2 graph goes grainy without one; `ConditioningZeroOut` on the mixed cond is fine for text-only CFG 1.
-- **Conditioning Krea 2 Rebalance** can sit on the CONDITIONING output (tap EQ). Orthogonal to this node.
-- `block_range`: `all` (default), `0-27`, or `4,8,12` if the effect compounds too hard.
+---
 
 ## Tests
 
-From this directory (no GPU):
+From this directory (no GPU required):
 
 ```bash
 python -m pytest tests -q
 ```
 
+---
+
 ## Credits
 
-Attention-side weighting for K2 follows the approach in [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) (`Krea2 Prompt Weight`): V-scale for de-emphasis, k-bias for emphasis. Prompt Mix is this pack’s encode-once mix for subject + moodboard, with optional Mustyrocks K2Edit Qwen grounding.
+Attention-side weighting for Krea 2 follows the approach in [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) (`Krea2 Prompt Weight`): V-scale for de-emphasis, k-bias for emphasis.
+
+---
 
 ## License
 
-Apache License 2.0. See `LICENSE`.
+Apache License 2.0. See [`LICENSE`](LICENSE).
+
+---
+
+## Endnote: Prompt Mix vs KJNodes `Krea2 Prompt Weight`
+
+Both nodes use the same **attention-side** idea (scale values / bias keys on token ranges inside K2 self-attention). They solve different jobs.
+
+| | **This pack — Krea2 Prompt Mix** | **KJNodes — Krea2 Prompt Weight** |
+|---|---|---|
+| **Job** | Two prompts, one encode: subject stays **1.0**, moodboard gets `aux_strength` | Weight **phrases inside one prompt** (attention equivalent of `(phrase:w)`) |
+| **How you write it** | Separate `text_main` + `text_aux` fields | One string with weighted spans / syntax KJNodes defines |
+| **Encode** | Single Qwen chat sequence — no double template from concat | Weights applied on ranges within that one prompt’s tokens |
+| **Best when** | Long moodboard dumps that would otherwise dominate the subject | Emphasize or soften specific words/phrases in a single instruction |
+| **K2 Edit** | Optional Mustyrocks-style Qwen3-VL grounding (`image` / `image_b`) built in | Use with your usual encode / grounding graph; not a drop-in Grounded Encode replacement |
+| **CFG / wiring** | Text-only mix expects **CFG 1**; wire **MODEL + CONDITIONING** | Follow KJNodes docs; still attention patches on the model path |
+
+**What is better where**
+
+- Prefer **Prompt Mix** when the problem is “handwritten subject + huge style/moodboard dump.” You get a clean main@1.0 / aux@scale split, one encode, and optional K2 Edit grounding without a second Grounded Encode on the positive path.
+- Prefer **KJNodes Prompt Weight** when you need fine, in-prompt phrase control — boost or cut individual words without splitting into two fields.
+- They are **complementary**, not replacements. Same underlying V-scale / k-bias mechanics; different UX and scope. Do not stack competing attention weight patches on the same blocks without knowing which wins last.
