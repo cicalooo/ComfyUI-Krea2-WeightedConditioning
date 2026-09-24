@@ -13,7 +13,8 @@ def test_mix_factors():
     assert mix_factors(0.45, "value_scale") == (0.45, 0.0)
     assert mix_factors(1.0, "value_scale") == (1.0, 0.0)
     assert mix_factors(0.5, "k_bias") == (0.5, 0.0)
-    assert mix_factors(1.5, "k_bias") == (1.0, 1.0)
+    assert mix_factors(1.5, "k_bias") == (1.0, 1.5)
+    assert mix_factors(1.5, "both") == (1.375, 1.5)
 
 
 def test_compose_preserves_ref_boost():

@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -7,13 +8,19 @@ import torch
 
 from krea2_weighted.attn_patch import compose_attn_mask
 from krea2_weighted.nodes import (
-    Krea2PromptMix,
+    GUIDE_DEFAULT_FOCUS,
+    IDENTITY_DEFAULT_FOCUS,
+    Krea2Encode,
+    Krea2EncodeOptions,
+    Krea2MultiRef,
     NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS,
+    _compact_refs,
     _grounding_images,
     _k2edit_template,
     _prep_grounding_image,
     K2EDIT_DEFAULT_SYSTEM,
+    resolve_layout,
 )
 from krea2_weighted.tokenize import (
     QWEN_IM_END,
@@ -104,27 +111,35 @@ def _rgb(h, w, val=0.2):
 
 
 def test_mappings():
-    assert list(NODE_CLASS_MAPPINGS) == ["Krea2PromptMix"]
-    assert NODE_DISPLAY_NAME_MAPPINGS["Krea2PromptMix"] == "Krea2 Prompt Mix"
-    types = Krea2PromptMix.INPUT_TYPES()
+    assert list(NODE_CLASS_MAPPINGS) == [
+        "Krea2Encode",
+        "Krea2EncodeOptions",
+        "Krea2MultiRef",
+    ]
+    assert "Krea2PromptMix" not in NODE_CLASS_MAPPINGS
+    assert NODE_DISPLAY_NAME_MAPPINGS["Krea2Encode"] == "Krea2 Split Encode"
+    assert NODE_DISPLAY_NAME_MAPPINGS["Krea2EncodeOptions"] == "Split Encode Options"
+    assert NODE_DISPLAY_NAME_MAPPINGS["Krea2MultiRef"] == "Split Ref"
+    types = Krea2Encode.INPUT_TYPES()
     assert "clip" in types["required"]
-    assert "text_main" in types["required"]
-    assert "text_aux" in types["required"]
+    assert "prompt" in types["required"]
+    assert "aux" in types["required"]
+    assert "identity" in types["optional"]
+    assert "scene" in types["optional"]
     assert "image" in types["optional"]
     assert "image_b" in types["optional"]
-    assert "grounding_px" in types["optional"]
-    assert "system_prompt" in types["optional"]
+    assert "refs" in types["optional"]
 
 
-def test_prompt_mix_scales_aux_only():
-    node = Krea2PromptMix()
+def test_encode_scales_aux_only():
+    node = Krea2Encode()
     model = FakeModel()
     clip = FakeClip()
     out_model, cond, debug = node.encode(
         clip,
         model,
-        text_main="a woman",
-        text_aux="cinematic grain",
+        prompt="a woman",
+        aux="cinematic grain",
         aux_strength=0.45,
     )
     assert out_model is not model
@@ -134,8 +149,8 @@ def test_prompt_mix_scales_aux_only():
     assert "aux id" in debug
 
 
-def test_prompt_mix_zero_strength_matches_standard_text_encode():
-    node = Krea2PromptMix()
+def test_encode_zero_strength_matches_standard_text_encode():
+    node = Krea2Encode()
     model = FakeModel()
     clip = FakeClip()
 
@@ -146,8 +161,8 @@ def test_prompt_mix_zero_strength_matches_standard_text_encode():
     out_model, cond, debug = node.encode(
         clip,
         model,
-        text_main="a woman",
-        text_aux="cinematic grain",
+        prompt="a woman",
+        aux="cinematic grain",
         aux_strength=0.0,
     )
 
@@ -157,8 +172,8 @@ def test_prompt_mix_zero_strength_matches_standard_text_encode():
     assert debug == "aux_strength=0.0; main only, no patch"
 
 
-def test_prompt_mix_zero_strength_matches_grounded_empty_aux():
-    node = Krea2PromptMix()
+def test_encode_zero_strength_matches_grounded_empty_aux():
+    node = Krea2Encode()
     image = _rgb(32, 32)
 
     zero_model = FakeModel()
@@ -166,8 +181,8 @@ def test_prompt_mix_zero_strength_matches_grounded_empty_aux():
     zero_out, zero_cond, zero_debug = node.encode(
         zero_clip,
         zero_model,
-        text_main="recolor the car",
-        text_aux="cinematic grain",
+        prompt="recolor the car",
+        aux="cinematic grain",
         aux_strength=0.0,
         image=image,
     )
@@ -177,8 +192,8 @@ def test_prompt_mix_zero_strength_matches_grounded_empty_aux():
     empty_out, empty_cond, _ = node.encode(
         empty_clip,
         empty_model,
-        text_main="recolor the car",
-        text_aux="",
+        prompt="recolor the car",
+        aux="",
         aux_strength=0.45,
         image=image,
     )
@@ -192,16 +207,16 @@ def test_prompt_mix_zero_strength_matches_grounded_empty_aux():
     assert zero_debug == "aux_strength=0.0; main only, no patch; grounded 1 image(s)"
 
 
-def test_prompt_mix_grounded_one_image():
-    node = Krea2PromptMix()
+def test_encode_grounded_one_image():
+    node = Krea2Encode()
     model = FakeModel()
     clip = FakeClip()
     img = _rgb(32, 32)
     out_model, cond, debug = node.encode(
         clip,
         model,
-        text_main="recolor the car",
-        text_aux="cinematic grain",
+        prompt="recolor the car",
+        aux="cinematic grain",
         aux_strength=0.45,
         image=img,
     )
@@ -210,8 +225,7 @@ def test_prompt_mix_grounded_one_image():
     tw = out_model.model_options["transformer_options"]["krea2_token_weights"]
     assert tw
     assert all(abs(p[1] - 0.45) < 1e-6 for p in tw)
-    # vision tokens occupy the front of the cond window
-    n_vis_markers = 2  # vis_start + vis_end (pad expands)
+    n_vis_markers = 2
     vis_block = n_vis_markers + VISION_EXPAND
     aux_pos = [p[0] for p in tw]
     assert min(aux_pos) >= vis_block
@@ -219,36 +233,35 @@ def test_prompt_mix_grounded_one_image():
     assert K2EDIT_DEFAULT_SYSTEM.split()[0] in (clip.last_template or "")
 
 
-def test_prompt_mix_two_image_ordering():
-    node = Krea2PromptMix()
+def test_encode_two_image_ordering():
+    node = Krea2Encode()
     clip = FakeClip()
     scene = _rgb(32, 32, 0.1)
     subject = _rgb(32, 32, 0.9)
     node.encode(
         clip,
         FakeModel(),
-        text_main="put the person in the room",
-        text_aux="film still",
+        prompt="put the person in the room",
+        aux="film still",
         aux_strength=0.4,
         image=scene,
         image_b=subject,
     )
     assert len(clip.last_images) == 2
-    # scene (image) first, subject (image_b) second
     assert float(clip.last_images[0].reshape(-1)[0]) < float(clip.last_images[1].reshape(-1)[0])
     vis = "<|vision_start|><|image_pad|><|vision_end|>"
     assert clip.last_template.count(vis) == 2
 
 
-def test_prompt_mix_aux_after_vision_expansion_only_aux_text():
-    node = Krea2PromptMix()
+def test_encode_aux_after_vision_expansion_only_aux_text():
+    node = Krea2Encode()
     clip = FakeClip()
     img = _rgb(28, 28)
     out_model, cond, debug = node.encode(
         clip,
         FakeModel(),
-        text_main="edit the jacket",
-        text_aux="neon",
+        prompt="edit the jacket",
+        aux="neon",
         aux_strength=0.3,
         image=img,
     )
@@ -256,43 +269,40 @@ def test_prompt_mix_aux_after_vision_expansion_only_aux_text():
     aux_pos = [p[0] for p in tw]
     vis_block = 2 + VISION_EXPAND
     assert min(aux_pos) >= vis_block
-    # cond: vis_start, 4 vision, vis_end, main tokens..., aux..., im_end
-    # "edit the jacket" = 3 tokens, "neon" = 1, plus im_end
     assert max(aux_pos) < cond[0][0].shape[1]
-    # do not weight the vision block
     assert not any(p < vis_block for p in aux_pos)
 
 
-def test_prompt_mix_empty_aux_still_grounded():
-    node = Krea2PromptMix()
+def test_encode_empty_aux_still_grounded():
+    node = Krea2Encode()
     model = FakeModel()
     clip = FakeClip()
     img = _rgb(32, 32)
     out_model, cond, debug = node.encode(
         clip,
         model,
-        text_main="recolor the car",
-        text_aux="",
+        prompt="recolor the car",
+        aux="",
         aux_strength=0.45,
         image=img,
     )
     assert out_model is model
     assert "empty aux" in debug
     assert "grounded 1 image" in debug
-    assert cond[0][0].shape[1] > 4  # vision expansion present
+    assert cond[0][0].shape[1] > 4
     assert clip.last_images is not None
 
 
-def test_prompt_mix_aux_strength_one_grounded_no_patch():
-    node = Krea2PromptMix()
+def test_encode_aux_strength_one_grounded_no_patch():
+    node = Krea2Encode()
     model = FakeModel()
     clip = FakeClip()
     img = _rgb(32, 32)
     out_model, cond, debug = node.encode(
         clip,
         model,
-        text_main="recolor the car",
-        text_aux="cinematic grain",
+        prompt="recolor the car",
+        aux="cinematic grain",
         aux_strength=1.0,
         image=img,
     )
@@ -305,9 +315,9 @@ def test_prompt_mix_aux_strength_one_grounded_no_patch():
 def test_k2edit_ref_mask_composes_with_key_bias():
     L = 8
     ref = torch.zeros(1, 1, L, L)
-    ref[:, :, 5:, 2:4] = 1.5  # K2Edit ref_boost on ref key columns
+    ref[:, :, 5:, 2:4] = 1.5
     kb = torch.zeros(1, L)
-    kb[:, 3] = 0.2  # Prompt Mix aux key bias
+    kb[:, 3] = 0.2
     out = compose_attn_mask(ref, kb)
     assert abs(float(out[0, 0, 5, 3]) - 1.7) < 1e-5
     assert abs(float(out[0, 0, 5, 2]) - 1.5) < 1e-5
@@ -329,3 +339,152 @@ def test_prep_28_pixel_grid_and_template():
     assert tpl.count("<|image_pad|>") == 2
 
 
+def test_compact_refs_skips_holes():
+    a = _rgb(8, 8, 0.1)
+    b = _rgb(8, 8, 0.9)
+    out = _compact_refs([
+        {"image": a, "strength": 1.0, "focus": "face", "mask": None},
+        {"image": None, "strength": 1.0, "focus": "", "mask": None},
+        {"image": b, "strength": 0.8, "focus": "pose", "mask": None},
+    ])
+    assert len(out) == 2
+    assert out[0]["focus"] == "face"
+    assert out[1]["focus"] == "pose"
+    assert abs(out[1]["strength"] - 0.8) < 1e-6
+
+
+def test_multi_ref_build_compacts():
+    node = Krea2MultiRef()
+    a = _rgb(8, 8, 0.2)
+    c = _rgb(8, 8, 0.8)
+    (refs,) = node.build(image_1=a, image_3=c, strength_3=0.4)
+    assert len(refs) == 2
+    assert abs(refs[1]["strength"] - 0.4) < 1e-6
+
+
+def test_encode_options_passthrough():
+    opts_node = Krea2EncodeOptions()
+    (opts,) = opts_node.build(people_count_lock="solo", emphasis_mode="both")
+    node = Krea2Encode()
+    out_model, cond, debug = node.encode(
+        FakeClip(),
+        FakeModel(),
+        prompt="a woman",
+        aux="photo",
+        aux_strength=0.45,
+        options=opts,
+    )
+    assert "people_count_lock=solo" in debug
+    assert "people_lock injected" in debug
+
+
+def test_k2edit_template_per_image_focus():
+    tpl = _k2edit_template(2, "", image_prompts=["focus on face", "focus on pose"])
+    assert "focus on face" in tpl
+    assert "focus on pose" in tpl
+    assert tpl.index("focus on face") < tpl.index("<|image_pad|>")
+
+
+def test_layout_scene_identity_guides():
+    scene = _rgb(8, 8, 0.1)
+    person = _rgb(8, 8, 0.9)
+    dress = _rgb(8, 8, 0.3)
+    hat = _rgb(8, 8, 0.4)
+    dit, qwen, notes = resolve_layout(
+        identity=person,
+        scene=scene,
+        refs=[{"image": dress}, {"image": hat}],
+        ref_boost=4.0,
+    )
+    assert [r["role"] for r in dit] == ["identity"]
+    assert [r["role"] for r in qwen] == ["scene", "guide", "guide", "identity"]
+    assert abs(dit[0]["boost"] - 4.0) < 1e-6
+    assert qwen[1]["focus"] == GUIDE_DEFAULT_FOCUS
+    assert qwen[-1]["focus"] == IDENTITY_DEFAULT_FOCUS
+    assert "scene is Qwen-only" in "\n".join(notes)
+
+
+def test_layout_aliases_lose_to_named_sockets():
+    scene = _rgb(8, 8, 0.1)
+    person = _rgb(8, 8, 0.9)
+    wrong_a = _rgb(8, 8, 0.2)
+    wrong_b = _rgb(8, 8, 0.3)
+    dit, qwen, notes = resolve_layout(
+        identity=person,
+        scene=scene,
+        image=wrong_a,
+        image_b=wrong_b,
+        ref_boost=4.0,
+    )
+    assert dit[0]["image"] is scene
+    assert dit[1]["image"] is person
+    assert any("wins over image_b" in n for n in notes)
+    assert any("wins over image" in n for n in notes)
+
+
+def test_layout_multiref_slot1_becomes_identity_when_missing():
+    person = _rgb(8, 8, 0.9)
+    dress = _rgb(8, 8, 0.3)
+    dit, qwen, notes = resolve_layout(
+        refs=[{"image": person, "strength": 1.0}, {"image": dress}],
+        ref_boost=4.0,
+    )
+    assert [r["role"] for r in dit] == ["identity"]
+    assert dit[0]["image"] is person
+    assert abs(dit[0]["boost"] - 4.0) < 1e-6
+    assert [r["role"] for r in qwen] == ["guide", "identity"]
+    assert any("slot 1 used as identity" in n for n in notes)
+
+
+def test_layout_multiref_does_not_replace_connected_identity():
+    person = _rgb(8, 8, 0.9)
+    dress = _rgb(8, 8, 0.3)
+    dit, qwen, _ = resolve_layout(
+        identity=person,
+        refs=[{"image": dress}],
+        ref_boost=4.0,
+    )
+    assert [r["role"] for r in dit] == ["identity"]
+    assert dit[0]["image"] is person
+    assert [r["role"] for r in qwen] == ["guide", "identity"]
+    assert qwen[0]["image"] is dress
+
+
+def test_encode_identity_is_last_qwen_image():
+    person = _rgb(32, 32, 0.9)
+    dress = _rgb(32, 32, 0.1)
+    (refs,) = Krea2MultiRef().build(image_1=dress)
+    clip = FakeClip()
+    Krea2Encode().encode(
+        clip,
+        FakeModel(),
+        prompt="restage this person wearing the dress",
+        aux="",
+        aux_strength=0.45,
+        identity=person,
+        refs=refs,
+    )
+    assert len(clip.last_images) == 2
+    assert float(clip.last_images[-1].reshape(-1)[0]) > float(clip.last_images[0].reshape(-1)[0])
+    assert GUIDE_DEFAULT_FOCUS.split(";")[0] in (clip.last_template or "")
+    assert IDENTITY_DEFAULT_FOCUS.split(";")[0] in (clip.last_template or "")
+
+
+def test_example_workflow_json():
+    path = Path(__file__).resolve().parents[1] / "workflows" / "krea2_encode_identity.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "nodes" in data and "links" in data
+    custom = [
+        n["type"]
+        for n in data["nodes"]
+        if str(n.get("type", "")).startswith("Krea2")
+    ]
+    allowed = set(NODE_CLASS_MAPPINGS)
+    assert custom
+    assert set(custom) <= allowed
+    assert "Krea2PromptMix" not in custom
+    assert "Krea2Encode" in custom
+    assert "Krea2MultiRef" in custom
+    types = {n["type"] for n in data["nodes"]}
+    assert "Krea2EditModelPatch" not in types
+    assert "VAEEncode" not in types

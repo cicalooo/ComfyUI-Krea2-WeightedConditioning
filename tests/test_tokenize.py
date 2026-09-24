@@ -71,3 +71,16 @@ def test_aux_span_suffix():
     assert list(ids_comb[s:e]) == aux_user
     assert mix_factors(0.45, "value_scale") == (0.45, 0.0)
     assert mix_factors(1.0, "value_scale") == (1.0, 0.0)
+
+
+def test_aux_id_span_grounded_skips_vision():
+    from krea2_weighted.tokenize import QWEN_IMAGE_PAD, aux_id_span_grounded
+
+    prefix = [QWEN_IM_START, QWEN_USER, QWEN_NL, 151652, QWEN_IMAGE_PAD, 151653]
+    main_user = [10, 11]
+    aux_user = [20, 21]
+    suffix = [QWEN_IM_END]
+    ids_main = prefix + main_user + suffix
+    ids_comb = prefix + main_user + aux_user + suffix
+    s, e = aux_id_span_grounded(ids_comb, ids_main)
+    assert list(ids_comb[s:e]) == aux_user

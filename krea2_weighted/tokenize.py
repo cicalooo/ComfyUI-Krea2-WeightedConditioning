@@ -119,6 +119,67 @@ def aux_id_span_in_combined(ids_combined: Sequence[int], ids_main: Sequence[int]
     return aux_start, ce
 
 
+# Common Qwen3-VL vision specials that can appear around IMAGE_PAD.
+_VISION_SPECIALS = frozenset({
+    QWEN_IMAGE_PAD,
+    151652,  # <|vision_start|>
+    151653,  # <|vision_end|>
+})
+
+
+def _text_after_vision(ids: Sequence[int], start: int, end: int) -> tuple[int, list]:
+    """Return (first_text_index, list of non-vision token ids) inside [start, end)."""
+    text_ids = []
+    first = None
+    for i in range(start, end):
+        t = ids[i]
+        if t in _VISION_SPECIALS or is_image_marker(t):
+            continue
+        if first is None:
+            first = i
+        text_ids.append(t if not isinstance(t, tuple) else t)
+    return (first if first is not None else end), text_ids
+
+
+def aux_id_span_grounded(
+    ids_combined: Sequence,
+    ids_main: Sequence,
+) -> tuple[int, int]:
+    """Aux span when vision tokens are present.
+
+    Strips vision markers, finds the main-text prefix on pure text, then maps
+    that offset back into the full combined ids. Falls back to
+    ``aux_id_span_in_combined`` if the vision-aware path fails.
+    """
+    cs, ce = user_span_from_ids(ids_combined)
+    ms, me = user_span_from_ids(ids_main)
+
+    _, comb_text = _text_after_vision(ids_combined, cs, ce)
+    _, main_text = _text_after_vision(ids_main, ms, me)
+
+    if not comb_text or not main_text:
+        return aux_id_span_in_combined(ids_combined, ids_main)
+
+    prefix = longest_prefix_len(comb_text, main_text)
+    if prefix == 0:
+        return aux_id_span_in_combined(ids_combined, ids_main)
+
+    seen = 0
+    aux_start = ce
+    for i in range(cs, ce):
+        t = ids_combined[i]
+        if t in _VISION_SPECIALS or is_image_marker(t):
+            continue
+        if seen == prefix:
+            aux_start = i
+            break
+        seen += 1
+    else:
+        aux_start = ce
+
+    return aux_start, ce
+
+
 def slice_to_cond_pairs(
     id_start: int,
     id_end: int,
@@ -178,14 +239,61 @@ def slice_to_cond_pairs_after_vision(
 
 
 def mix_factors(aux_strength: float, emphasis_mode: str = "value_scale") -> tuple[float, float]:
-    """Map a 0..N aux strength to (v_factor, k_bias). 1.0 is a no-op."""
+    """Map a 0..N strength to (v_factor, k_bias). 1.0 is a no-op.
+
+    Below 1.0, value_scale / k_bias / both all scale V (or return s).
+    Above 1.0, k_bias and both use a steeper key ramp so enforce terms
+    can compete with vision tokens. value_scale stays a plain V multiply.
+    """
     s = float(aux_strength)
     if emphasis_mode == "k_bias":
         if s > 1.0:
-            return 1.0, (s - 1.0) * 2.0
+            return 1.0, (s - 1.0) * 3.0
         return s, 0.0
     if emphasis_mode == "both":
         if s > 1.0:
-            return 1.0 + (s - 1.0) * 0.5, (s - 1.0) * 2.0
+            return 1.0 + (s - 1.0) * 0.75, (s - 1.0) * 3.0
         return s, 0.0
     return s, 0.0
+
+
+def vision_cond_pairs_per_image(
+    ids: Sequence,
+    cond_len: int,
+    strengths: Sequence[float],
+    emphasis_mode: str = "value_scale",
+) -> list[tuple[int, float, float]]:
+    """Weight pairs for each image's expanded vision tokens.
+
+    ``strengths[i]`` controls the i-th ``<|image_pad|>``. Strength ≈ 1.0
+    produces no pairs. Surrounding vision_start / vision_end stay at 1.0.
+    """
+    start, _ = user_span_from_ids(ids)
+    extra = vision_expansion_extra(ids, cond_len)
+    image_ix = [j for j, t in enumerate(ids) if t == QWEN_IMAGE_PAD]
+    if not image_ix:
+        return []
+
+    n = len(image_ix)
+    extras_at: dict[int, int] = {}
+    if extra:
+        base, rem = divmod(extra, n)
+        for k, j in enumerate(image_ix):
+            extras_at[j] = base + (1 if k >= n - rem else 0)
+
+    pairs: list[tuple[int, float, float]] = []
+    acc_extra = 0
+    for i, tok in enumerate(ids):
+        n_extra = extras_at.get(i, 0)
+        if tok == QWEN_IMAGE_PAD:
+            pad_idx = image_ix.index(i)
+            if pad_idx < len(strengths):
+                s = float(strengths[pad_idx])
+                v_factor, k_bias = mix_factors(s, emphasis_mode)
+                if abs(v_factor - 1.0) > 1e-6 or abs(k_bias) > 1e-6:
+                    for e in range(n_extra):
+                        cp = (i - start) + acc_extra + e
+                        if 0 <= cp < cond_len:
+                            pairs.append((cp, v_factor, k_bias))
+        acc_extra += n_extra
+    return pairs

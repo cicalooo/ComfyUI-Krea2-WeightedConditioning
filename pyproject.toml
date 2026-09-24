@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-krea2-weightedconditioning"
-description = "Krea 2 Prompt Mix: main prompt at 1.0, auxiliary/moodboard scaled; optional Mustyrocks K2Edit Qwen3-VL grounding."
-version = "0.3.0"
+description = "Krea2 Split Encode: person as a VAE frame, scene and clothing as Qwen placement; prompt mix plus Identity Edit without source latents."
+version = "1.0.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,5 +16,5 @@ Repository = "https://github.com/cicalooo/ComfyUI-Krea2-WeightedConditioning"
 
 [tool.comfy]
 PublisherId = "cicalooo"
-DisplayName = "Krea 2 Weighted Conditioning"
+DisplayName = "Krea2 Split Encode"
 Icon = ""
