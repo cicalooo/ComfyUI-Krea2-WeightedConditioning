@@ -2,6 +2,8 @@
 
 One encode for Krea 2. The person is a VAE frame. Scene and clothing are Qwen placement, not extra appearance frames.
 
+![Krea2 Split Encode identity workflow](split-encode.png)
+
 Stock `(word:1.4)` does nothing here. Krea 2 reads prompts through Qwen3-VL. This pack scales only the aux tokens inside one chat sequence, and runs the Identity Edit pixel path when a VAE is connected. No per-image `VAEEncode`. No Mustyrocks `Krea2EditModelPatch`.
 
 | | |
@@ -65,6 +67,10 @@ Stay **≤2MP**. At CFG > 1, negative is a second Encode with an empty prompt, t
 **Split Ref** — up to 5 clothing/object guides. Not VAE frames. If no person is wired, slot 1 becomes identity.
 
 Longer notes: [docs/reference.md](docs/reference.md).
+
+## Additional credit
+
+Mustyrocks **Krea2Edit** (the Identity Edit LoRA, grounded encode, and pixel-path source patch) and **Birds Weighted Conditioning** (per-ref focus, vision strengths, and the in-node edit wrap) both pass through this pack. This node is a split of those paths, not a replacement of their work.
 
 ## License
 
