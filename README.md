@@ -72,7 +72,7 @@ Longer notes: [docs/reference.md](docs/reference.md).
 
 ## Additional credit
 
-Mustyrocks **Krea2Edit** (the Identity Edit LoRA, grounded encode, and pixel-path source patch) and **Birds Weighted Conditioning** (per-ref focus, vision strengths, and the in-node edit wrap) both pass through this pack. This node is a split of those paths, not a replacement of their work.
+Mustyrocks **Krea2Edit** and **Birds Weighted Conditioning** (per-ref focus, vision strengths, and the in-node edit wrap) both pass through this pack. This node is a split of those paths, not a replacement of their work.
 
 Moodboard aux text is optional and lives in a separate pack: [ComfyUI-Krea-Moodboards](https://github.com/Andro-Meta/ComfyUI-Krea-Moodboards) (Andro-Meta). Not bundled here.
 
