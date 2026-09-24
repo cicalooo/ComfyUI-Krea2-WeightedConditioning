@@ -23,6 +23,8 @@ git clone https://github.com/cicalooo/ComfyUI-Krea2-WeightedConditioning.git
 
 Restart ComfyUI. Native Krea 2 only. No extra pip packages.
 
+Optional moodboards: [Andro-Meta/ComfyUI-Krea-Moodboards](https://github.com/Andro-Meta/ComfyUI-Krea-Moodboards). Wire **Visual Browser `positive`** into Encode **`aux`**.
+
 ## Wire
 
 Load the Identity Edit LoRA **before** this node. Wire **MODEL** and **CONDITIONING** to the sampler.
@@ -71,6 +73,8 @@ Longer notes: [docs/reference.md](docs/reference.md).
 ## Additional credit
 
 Mustyrocks **Krea2Edit** (the Identity Edit LoRA, grounded encode, and pixel-path source patch) and **Birds Weighted Conditioning** (per-ref focus, vision strengths, and the in-node edit wrap) both pass through this pack. This node is a split of those paths, not a replacement of their work.
+
+Moodboard aux text is optional and lives in a separate pack: [ComfyUI-Krea-Moodboards](https://github.com/Andro-Meta/ComfyUI-Krea-Moodboards) (Andro-Meta). Not bundled here.
 
 ## License
 
