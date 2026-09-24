@@ -78,4 +78,4 @@ Moodboard aux text is optional and lives in a separate pack: [ComfyUI-Krea-Moodb
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). Identity Edit pixel path is vendored from [comfyui-krea2edit](https://github.com/lbouaraba/comfyui-krea2edit). Attention weighting follows [KJNodes](https://github.com/kijai/ComfyUI-KJNodes) `Krea2 Prompt Weight`. Do not stack a second attention-weight patch on the same blocks.
+Apache-2.0. See [LICENSE](LICENSE). Identity Edit pixel path is vendored from [comfyui-krea2edit](https://github.com/lbouaraba/comfyui-krea2edit). Do not stack a second attention-weight patch on the same blocks.
